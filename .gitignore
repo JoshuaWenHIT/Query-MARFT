@@ -6,3 +6,4 @@ build/
 *.egg
 *.egg-info
 *.mp4
+.idea
