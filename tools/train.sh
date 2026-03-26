@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ------------------------------------------------------------------------
-# Copyright (c) 2022 megvii-research. All Rights Reserved.
+# Copyright (c) 2026 JoshuaWenHIT. All Rights Reserved.
 # ------------------------------------------------------------------------
 
 
