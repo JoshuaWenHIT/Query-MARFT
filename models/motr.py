@@ -176,6 +176,9 @@ class ClipMatcher(SetCriterion):
         outputs_without_aux = {k: v for k, v in outputs.items() if k != 'aux_outputs'}
 
         gt_instances_i = self.gt_instances[self._current_frame_idx]  # gt instances of i-th image.
+        # Support batch_size > 1: gt_instances may be list of lists
+        if isinstance(gt_instances_i, list):
+            gt_instances_i = gt_instances_i[0]
         track_instances: Instances = outputs_without_aux['track_instances']
         pred_logits_i = track_instances.pred_logits  # predicted logits of i-th image.
         pred_boxes_i = track_instances.pred_boxes  # predicted boxes of i-th image.
@@ -653,36 +656,54 @@ class MOTR(nn.Module):
     def forward(self, data: dict):
         if self.training:
             self.criterion.initialize_for_single_clip(data['gt_instances'])
-        frames = data['imgs']  # list of Tensor.
+        frames = data['imgs']
         outputs = {
             'pred_logits': [],
             'pred_boxes': [],
         }
         track_instances = None
         keys = list(self._generate_empty_tracks()._fields.keys())
+
+        # Support batch_size > 1
         for frame_index, (frame, gt, proposals) in enumerate(zip(frames, data['gt_instances'], data['proposals'])):
-            frame.requires_grad = False
+            # Handle frame.requires_grad safely for both batch=1 and batch>1
+            if isinstance(frame, torch.Tensor):
+                frame.requires_grad = False
+            elif isinstance(frame, (list, tuple)):
+                for f in frame:
+                    if isinstance(f, torch.Tensor):
+                        f.requires_grad = False
+
             is_last = frame_index == len(frames) - 1
 
+            # gt may be list[Instances] when batch_size > 1
             if self.query_denoise > 0:
                 l_1 = l_2 = self.query_denoise
-                gtboxes = gt.boxes.clone()
+                gt_for_denoise = gt[0] if isinstance(gt, list) else gt
+                gtboxes = gt_for_denoise.boxes.clone()
                 _rs = torch.rand_like(gtboxes) * 2 - 1
                 gtboxes[..., :2] += gtboxes[..., 2:] * _rs[..., :2] * l_1
                 gtboxes[..., 2:] *= 1 + l_2 * _rs[..., 2:]
             else:
                 gtboxes = None
 
+            # proposals may be list when batch_size > 1
+            prop = proposals[0] if isinstance(proposals, list) else proposals
+
             if track_instances is None:
-                track_instances = self._generate_empty_tracks(proposals)
+                track_instances = self._generate_empty_tracks(prop)
             else:
                 track_instances = Instances.cat([
-                    self._generate_empty_tracks(proposals),
+                    self._generate_empty_tracks(prop),
                     track_instances])
 
             if self.use_checkpoint and frame_index < len(frames) - 1:
                 def fn(frame, gtboxes, *args):
-                    frame = nested_tensor_from_tensor_list([frame])
+                    # Support list of tensors when batch_size > 1
+                    if isinstance(frame, (list, tuple)):
+                        frame = nested_tensor_from_tensor_list(frame)
+                    else:
+                        frame = nested_tensor_from_tensor_list([frame])
                     tmp = Instances((1, 1), **dict(zip(keys, args)))
                     frame_res = self._forward_single_image(frame, tmp, gtboxes)
                     return (
@@ -706,7 +727,11 @@ class MOTR(nn.Module):
                     } for i in range(5)],
                 }
             else:
-                frame = nested_tensor_from_tensor_list([frame])
+                # frame could be list of tensors when batch_size > 1
+                if isinstance(frame, (list, tuple)):
+                    frame = nested_tensor_from_tensor_list(frame)
+                else:
+                    frame = nested_tensor_from_tensor_list([frame])
                 frame_res = self._forward_single_image(frame, track_instances, gtboxes)
             current_run_mode = data.get('run_mode', 'supervised' if self.training else 'inference')
             frame_res = self._post_process_single_image(frame_res, track_instances, is_last, run_mode=current_run_mode)
