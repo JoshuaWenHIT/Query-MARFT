@@ -279,6 +279,10 @@ def collate_fn(batch):
 
 
 def mot_collate_fn(batch: List[dict]) -> dict:
+    """Collate function for MOTR.
+    Supports batch_size > 1 by keeping structure as lists.
+    For true efficient batching, we may later stack images into (B, T, C, H, W).
+    """
     ret_dict = {}
     for key in list(batch[0].keys()):
         assert not isinstance(batch[0][key], Tensor)

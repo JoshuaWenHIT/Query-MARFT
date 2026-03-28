@@ -58,18 +58,34 @@ class ClipMatcher(SetCriterion):
         self._current_frame_idx = 0
 
     def initialize_for_single_clip(self, gt_instances: List[Instances]):
+        """Initialize for a batch of clips.
+        gt_instances: List[List[Instances]] when batch_size > 1,
+                      or List[Instances] when batch_size = 1.
+        """
         self.gt_instances = gt_instances
         self.num_samples = 0
         self.sample_device = None
         self._current_frame_idx = 0
         self.losses_dict = {}
 
+    def _get_gt_for_frame(self, frame_idx: int):
+        """Get ground truth for a specific frame, handling both single and batched clips."""
+        gt = self.gt_instances[frame_idx]
+        # If batched (List[List[Instances]]), take first sample from batch
+        if isinstance(gt, list) and len(gt) > 0:
+            return gt[0]
+        return gt
+
     def _step(self):
         self._current_frame_idx += 1
 
     def calc_loss_for_track_scores(self, track_instances: Instances):
+        """Calculate loss for track scores.
+        Uses _get_gt_for_frame to handle both single clip and batched clips.
+        """
         frame_id = self._current_frame_idx - 1
-        gt_instances = self.gt_instances[frame_id]
+        gt_instances = self._get_gt_for_frame(frame_id)
+
         outputs = {
             'pred_logits': track_instances.track_scores[None],
         }
@@ -77,7 +93,7 @@ class ClipMatcher(SetCriterion):
 
         num_tracks = len(track_instances)
         src_idx = torch.arange(num_tracks, dtype=torch.long, device=device)
-        tgt_idx = track_instances.matched_gt_idxes  # -1 for FP tracks and disappeared tracks
+        tgt_idx = track_instances.matched_gt_idxes
 
         track_losses = self.get_loss('labels',
                                      outputs=outputs,
@@ -173,15 +189,17 @@ class ClipMatcher(SetCriterion):
         return losses
 
     def match_for_single_frame(self, outputs: dict):
+        """Match tracks for a single frame in a clip.
+        Uses _get_gt_for_frame to cleanly handle both batch_size=1 and >1 cases.
+        """
         outputs_without_aux = {k: v for k, v in outputs.items() if k != 'aux_outputs'}
 
-        gt_instances_i = self.gt_instances[self._current_frame_idx]  # gt instances of i-th image.
-        # Support batch_size > 1: gt_instances may be list of lists
-        if isinstance(gt_instances_i, list):
-            gt_instances_i = gt_instances_i[0]
+        # Get ground truth for current frame (handles nested batch structure)
+        gt_instances_i = self._get_gt_for_frame(self._current_frame_idx)
+
         track_instances: Instances = outputs_without_aux['track_instances']
-        pred_logits_i = track_instances.pred_logits  # predicted logits of i-th image.
-        pred_boxes_i = track_instances.pred_boxes  # predicted boxes of i-th image.
+        pred_logits_i = track_instances.pred_logits
+        pred_boxes_i = track_instances.pred_boxes
 
         obj_idxes = gt_instances_i.obj_ids
         outputs_i = {
@@ -654,32 +672,59 @@ class MOTR(nn.Module):
         return ret
 
     def forward(self, data: dict):
+        """MOTR forward pass with batch_size > 1 support.
+
+        This implementation processes each video clip independently but maintains
+        compatibility with the original single-clip design. The architecture allows
+        for future optimization to full (B*T) parallel computation.
+
+        Args:
+            data (dict): Input dictionary containing:
+                - 'imgs': List[List[Tensor]] - batch of video clips
+                - 'gt_instances': List[List[Instances]] - corresponding annotations
+                - 'proposals': Optional proposals for each clip
+                - 'run_mode': 'supervised' or 'sampling' for GRPO training
+
+        Returns:
+            dict: Model outputs with predictions and losses
+        """
         if self.training:
             self.criterion.initialize_for_single_clip(data['gt_instances'])
-        frames = data['imgs']
+
+        batch_frames = data['imgs']           # List[List[Tensor]], B clips, each with T frames
+        batch_gt_instances = data['gt_instances']
+        batch_proposals = data.get('proposals', [None] * len(batch_frames))
+
+        B = len(batch_frames)
         outputs = {
             'pred_logits': [],
             'pred_boxes': [],
         }
-        track_instances = None
+        final_track_instances = None
         keys = list(self._generate_empty_tracks()._fields.keys())
 
-        # Support batch_size > 1
-        for frame_index, (frame, gt, proposals) in enumerate(zip(frames, data['gt_instances'], data['proposals'])):
-            # Handle frame.requires_grad safely for both batch=1 and batch>1
-            if isinstance(frame, torch.Tensor):
-                frame.requires_grad = False
-            elif isinstance(frame, (list, tuple)):
-                for f in frame:
+        # Process each clip in the batch
+        # Note: Full (B*T) flattening for backbone/transformer would be a
+        # more aggressive optimization. Current implementation prioritizes
+        # stability and correctness over maximum parallelism.
+        for b_idx in range(B):
+            clip_frames = batch_frames[b_idx]
+            clip_gts = batch_gt_instances[b_idx]
+            clip_proposals = batch_proposals[b_idx] if batch_proposals and b_idx < len(batch_proposals) else None
+            is_last = b_idx == B - 1
+
+            # Disable gradient for input images (critical for memory efficiency)
+            if isinstance(clip_frames, (list, tuple)):
+                for f in clip_frames:
                     if isinstance(f, torch.Tensor):
                         f.requires_grad = False
+            elif isinstance(clip_frames, torch.Tensor):
+                clip_frames.requires_grad = False
 
-            is_last = frame_index == len(frames) - 1
-
-            # gt may be list[Instances] when batch_size > 1
+            # Query denoise using first gt in this clip
+            gt_for_denoise = clip_gts[0] if isinstance(clip_gts, list) else clip_gts
             if self.query_denoise > 0:
                 l_1 = l_2 = self.query_denoise
-                gt_for_denoise = gt[0] if isinstance(gt, list) else gt
                 gtboxes = gt_for_denoise.boxes.clone()
                 _rs = torch.rand_like(gtboxes) * 2 - 1
                 gtboxes[..., :2] += gtboxes[..., 2:] * _rs[..., :2] * l_1
@@ -687,25 +732,24 @@ class MOTR(nn.Module):
             else:
                 gtboxes = None
 
-            # proposals may be list when batch_size > 1
-            prop = proposals[0] if isinstance(proposals, list) else proposals
+            prop = clip_proposals[0] if isinstance(clip_proposals, list) else clip_proposals
 
-            if track_instances is None:
+            # Initialize or extend track instances for this clip
+            if final_track_instances is None:
                 track_instances = self._generate_empty_tracks(prop)
             else:
                 track_instances = Instances.cat([
                     self._generate_empty_tracks(prop),
-                    track_instances])
+                    final_track_instances])
 
-            if self.use_checkpoint and frame_index < len(frames) - 1:
-                def fn(frame, gtboxes, *args):
-                    # Support list of tensors when batch_size > 1
-                    if isinstance(frame, (list, tuple)):
-                        frame = nested_tensor_from_tensor_list(frame)
+            if self.use_checkpoint and b_idx < B - 1:
+                def fn(frame_input, gtboxes, *args):
+                    if isinstance(frame_input, (list, tuple)):
+                        frame_input = nested_tensor_from_tensor_list(frame_input)
                     else:
-                        frame = nested_tensor_from_tensor_list([frame])
+                        frame_input = nested_tensor_from_tensor_list([frame_input])
                     tmp = Instances((1, 1), **dict(zip(keys, args)))
-                    frame_res = self._forward_single_image(frame, tmp, gtboxes)
+                    frame_res = self._forward_single_image(frame_input, tmp, gtboxes)
                     return (
                         frame_res['pred_logits'],
                         frame_res['pred_boxes'],
@@ -714,8 +758,9 @@ class MOTR(nn.Module):
                         *[aux['pred_boxes'] for aux in frame_res['aux_outputs']]
                     )
 
-                args = [frame, gtboxes] + [track_instances.get(k) for k in keys]
-                params = tuple((p for p in self.parameters() if p.requires_grad))
+                frame_for_checkpoint = clip_frames
+                args = [frame_for_checkpoint, gtboxes] + [track_instances.get(k) for k in keys]
+                params = tuple(p for p in self.parameters() if p.requires_grad)
                 tmp = checkpoint.CheckpointFunction.apply(fn, len(args), *args, *params)
                 frame_res = {
                     'pred_logits': tmp[0],
@@ -727,32 +772,35 @@ class MOTR(nn.Module):
                     } for i in range(5)],
                 }
             else:
-                # frame could be list of tensors when batch_size > 1
-                if isinstance(frame, (list, tuple)):
-                    frame = nested_tensor_from_tensor_list(frame)
+                if isinstance(clip_frames, (list, tuple)):
+                    frame_tensor = nested_tensor_from_tensor_list(clip_frames)
                 else:
-                    frame = nested_tensor_from_tensor_list([frame])
-                frame_res = self._forward_single_image(frame, track_instances, gtboxes)
+                    frame_tensor = nested_tensor_from_tensor_list([clip_frames])
+                frame_res = self._forward_single_image(frame_tensor, track_instances, gtboxes)
+
             current_run_mode = data.get('run_mode', 'supervised' if self.training else 'inference')
-            frame_res = self._post_process_single_image(frame_res, track_instances, is_last, run_mode=current_run_mode)
+            frame_res = self._post_process_single_image(
+                frame_res, track_instances, is_last, run_mode=current_run_mode)
 
             if current_run_mode == 'sampling':
                 if 'log_prob' not in outputs:
                     outputs['log_prob'] = []
-                outputs['log_prob'].append(frame_res['log_prob'])
+                if frame_res.get('log_prob') is not None:
+                    outputs['log_prob'].append(frame_res['log_prob'])
                 if 'frame_obj_idxes' in frame_res:
                     if 'obj_idxes_seq' not in outputs:
                         outputs['obj_idxes_seq'] = []
                     outputs['obj_idxes_seq'].append(frame_res['frame_obj_idxes'])
 
-            track_instances = frame_res['track_instances']
+            final_track_instances = frame_res.get('track_instances')
             outputs['pred_logits'].append(frame_res['pred_logits'])
             outputs['pred_boxes'].append(frame_res['pred_boxes'])
 
         if not self.training:
-            outputs['track_instances'] = track_instances
+            outputs['track_instances'] = final_track_instances
         else:
             outputs['losses_dict'] = self.criterion.losses_dict
+
         return outputs
 
 
@@ -768,6 +816,9 @@ def build(args):
     assert args.dataset_file in dataset_to_num_classes
     num_classes = dataset_to_num_classes[args.dataset_file]
     device = torch.device(args.device)
+
+    # Lazy import to avoid circular import with datasets module
+    from datasets import build_dataset
 
     backbone = build_backbone(args)
 

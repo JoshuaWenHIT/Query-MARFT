@@ -238,7 +238,7 @@ def main(args):
     collate_fn = utils.mot_collate_fn
     data_loader_train = DataLoader(dataset_train, batch_sampler=batch_sampler_train,
                                    collate_fn=collate_fn, num_workers=args.num_workers,
-                                   pin_memory=True)
+                                   pin_memory=False)  # Disable due to complex nested data structure
 
     def match_name_keywords(n, name_keywords):
         out = False
