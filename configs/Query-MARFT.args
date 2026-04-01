@@ -1,13 +1,13 @@
 --meta_arch motr
 --dataset_file e2e_dance
---mot_path /home/sata/JoshuaWen/Datasets/Tracking-pre/RGB/MOT
+--mot_path /root/autodl-tmp
 --epoch 5
 --with_box_refine
 --lr_drop 4
 --lr 1e-4
 --lr_backbone 2e-5
---pretrained /home/sata/JoshuaWen/Models/MOTRv2/motrv2_dancetrack.pth
---batch_size 1
+--pretrained /root/autodl-tmp/motrv2_dancetrack.pth
+--batch_size 2
 --sample_mode random_interval
 --sample_interval 10
 --sampler_lengths 5
@@ -19,6 +19,11 @@
 --query_denoise 0.05
 --num_queries 10
 --append_crowd
+--append_dance_val
 --det_db det_db_motrv2.json
 --use_checkpoint
 --freeze_backbone
+--use_grpo
+--use_unitrack
+--unitrack_loss_coef 1.5
+--unitrack_iou_threshold 0.5

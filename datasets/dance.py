@@ -1,4 +1,6 @@
 # ------------------------------------------------------------------------
+# Copyright (c) 2026 Joshua Wen. All Rights Reserved.
+# ------------------------------------------------------------------------
 # Copyright (c) 2022 megvii-research. All Rights Reserved.
 # ------------------------------------------------------------------------
 # Modified from Deformable DETR (https://github.com/fundamentalvision/Deformable-DETR)
@@ -66,6 +68,8 @@ class DetMOTDetection:
                     self.labels_full[vid][t].append([x, y, w, h, i, crowd])
 
         add_mot_folder("DanceTrack/train")
+        if getattr(args, 'append_dance_val', False):
+            add_mot_folder("DanceTrack/val")
         vid_files = list(self.labels_full.keys())
 
         self.indices = []

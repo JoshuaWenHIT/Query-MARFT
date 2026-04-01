@@ -1,5 +1,5 @@
 # ------------------------------------------------------------------------
-# Copyright (c) 2026 JoshuaWenHIT. All Rights Reserved.
+# Copyright (c) 2026 Joshua Wen. All Rights Reserved.
 # ------------------------------------------------------------------------
 # Copyright (c) 2022 megvii-research. All Rights Reserved.
 # ------------------------------------------------------------------------
@@ -100,6 +100,9 @@ def get_args_parser():
     parser.add_argument('--val_width', default=800, type=int)
     parser.add_argument('--filter_ignore', action='store_true')
     parser.add_argument('--append_crowd', default=False, action='store_true')
+    parser.add_argument('--append_dance_val', default=False, action='store_true',
+                        help='Add DanceTrack val split (GT trajectories) into training sampling; '
+                             'requires det_db keys for DanceTrack/val frames (e.g. det_db_motrv2.json).')
 
     # * Segmentation
     parser.add_argument('--masks', action='store_true',
@@ -125,6 +128,22 @@ def get_args_parser():
     parser.add_argument('--bbox_loss_coef', default=5, type=float)
     parser.add_argument('--giou_loss_coef', default=2, type=float)
     parser.add_argument('--focal_alpha', default=0.25, type=float)
+    parser.add_argument('--use_unitrack', action='store_true',
+                        help='Enable UniTrack loss on top of existing MOTRv2 losses')
+    parser.add_argument('--unitrack_loss_coef', default=1.0, type=float,
+                        help='Weight coefficient for UniTrack total loss')
+    parser.add_argument('--unitrack_iou_threshold', default=0.5, type=float,
+                        help='IoU threshold used in UniTrack tracking loss')
+    parser.add_argument('--unitrack_img_width', default=1920, type=int,
+                        help='Image width used for UniTrack normalization')
+    parser.add_argument('--unitrack_img_height', default=1080, type=int,
+                        help='Image height used for UniTrack normalization')
+    parser.add_argument('--unitrack_alpha_tracking', default=2.0, type=float)
+    parser.add_argument('--unitrack_alpha_spatial', default=1.5, type=float)
+    parser.add_argument('--unitrack_alpha_temporal', default=1.8, type=float)
+    parser.add_argument('--unitrack_beta_fp', default=0.9, type=float)
+    parser.add_argument('--unitrack_beta_fn', default=0.9, type=float)
+    parser.add_argument('--unitrack_gamma_switch', default=1.5, type=float)
 
     # dataset parameters
     parser.add_argument('--dataset_file', default='coco')
@@ -184,7 +203,7 @@ def get_args_parser():
     parser.add_argument('--grpo_id_switch_penalty', type=float, default=15.0)
     parser.add_argument('--grpo_id_stable_reward', type=float, default=1.0)
     parser.add_argument('--grpo_loss_weight', type=float, default=1.0, help='Weight for GRPO reward loss in total loss')
-    parser.add_argument('--grpo_group_size', type=int, default=4, help='Number of samples per group for GRPO advantage')
+    parser.add_argument('--grpo_group_size', type=int, default=5, help='Number of samples per group for GRPO advantage')
     return parser
 
 
@@ -236,9 +255,12 @@ def main(args):
     batch_sampler_train = torch.utils.data.BatchSampler(
         sampler_train, args.batch_size, drop_last=True)
     collate_fn = utils.mot_collate_fn
+    # batch_size>1 时 mot_collate 为 clips→frames→tensor 三层嵌套，pin_memory 会大量递归固定
+    # 宿主内存；在旧版 PyTorch(THC) 与多卡 DataLoader 上易触发 THCCachingHostAllocator 报错。
+    pin_memory = args.batch_size == 1
     data_loader_train = DataLoader(dataset_train, batch_sampler=batch_sampler_train,
                                    collate_fn=collate_fn, num_workers=args.num_workers,
-                                   pin_memory=False)  # Disable due to complex nested data structure
+                                   pin_memory=pin_memory)
 
     def match_name_keywords(n, name_keywords):
         out = False

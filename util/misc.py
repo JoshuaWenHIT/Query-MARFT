@@ -1,4 +1,6 @@
 # ------------------------------------------------------------------------
+# Copyright (c) 2026 JoshuaWenHIT. All Rights Reserved.
+# ------------------------------------------------------------------------
 # Copyright (c) 2022 megvii-research. All Rights Reserved.
 # ------------------------------------------------------------------------
 # Modified from Deformable DETR (https://github.com/fundamentalvision/Deformable-DETR)
@@ -20,7 +22,7 @@ import time
 from collections import defaultdict, deque
 import datetime
 import pickle
-from typing import Optional, List
+from typing import Any, Dict, Iterator, List, Optional
 
 import torch
 import torch.nn as nn
@@ -279,10 +281,6 @@ def collate_fn(batch):
 
 
 def mot_collate_fn(batch: List[dict]) -> dict:
-    """Collate function for MOTR.
-    Supports batch_size > 1 by keeping structure as lists.
-    For true efficient batching, we may later stack images into (B, T, C, H, W).
-    """
     ret_dict = {}
     for key in list(batch[0].keys()):
         assert not isinstance(batch[0][key], Tensor)
@@ -290,6 +288,32 @@ def mot_collate_fn(batch: List[dict]) -> dict:
         if len(ret_dict[key]) == 1:
             ret_dict[key] = ret_dict[key][0]
     return ret_dict
+
+
+def iter_mot_clip_dicts(data_dict: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
+    """
+    Split a batch from mot_collate_fn into one dict per clip.
+
+    With batch_size==1, collate unwraps so ``imgs`` is a list of frame tensors
+    for a single clip. With batch_size>1, ``imgs`` is a list of clips, each
+    clip being a list of frame tensors. MOTR.forward expects the former; this
+    iterator yields per-clip dicts so the model/criterion path stays unchanged.
+    """
+    imgs = data_dict['imgs']
+    if len(imgs) == 0:
+        yield data_dict
+        return
+    if isinstance(imgs[0], Tensor):
+        yield data_dict
+        return
+    B = len(imgs)
+    split_keys = ('imgs', 'gt_instances', 'proposals')
+    for i in range(B):
+        piece = {k: data_dict[k][i] for k in split_keys if k in data_dict}
+        for k, v in data_dict.items():
+            if k not in piece:
+                piece[k] = v
+        yield piece
 
 
 def _max_by_axis(the_list):

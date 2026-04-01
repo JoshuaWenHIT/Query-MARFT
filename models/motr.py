@@ -1,5 +1,5 @@
 # ------------------------------------------------------------------------
-# Copyright (c) 2026 JoshuaWenHIT. All Rights Reserved.
+# Copyright (c) 2026 Joshua Wen. All Rights Reserved.
 # ------------------------------------------------------------------------
 # Copyright (c) 2022 megvii-research. All Rights Reserved.
 # ------------------------------------------------------------------------
@@ -33,13 +33,23 @@ from .matcher import build_matcher
 from .deformable_transformer_plus import build_deforamble_transformer, pos2posemb
 from .qim import build as build_query_interaction_layer
 from .deformable_detr import SetCriterion, MLP, sigmoid_focal_loss
+from .unitrack_criterion import UnitrackCriterion
 
 
 class ClipMatcher(SetCriterion):
     def __init__(self, num_classes,
                         matcher,
                         weight_dict,
-                        losses):
+                        losses,
+                        use_unitrack=False,
+                        unitrack_img_size=(1920, 1080),
+                        unitrack_iou_threshold=0.5,
+                        unitrack_alpha_tracking=2.0,
+                        unitrack_alpha_spatial=1.5,
+                        unitrack_alpha_temporal=1.8,
+                        unitrack_beta_fp=0.9,
+                        unitrack_beta_fn=0.9,
+                        unitrack_gamma_switch=1.5):
         """ Create the criterion.
         Parameters:
             num_classes: number of object categories, omitting the special no-object category
@@ -56,36 +66,33 @@ class ClipMatcher(SetCriterion):
         self.focal_loss = True
         self.losses_dict = {}
         self._current_frame_idx = 0
+        self.use_unitrack = use_unitrack
+        self.unitrack = None
+        if self.use_unitrack:
+            self.unitrack = UnitrackCriterion(
+                img_size=unitrack_img_size,
+                iou_threshold=unitrack_iou_threshold,
+                alpha_tracking=unitrack_alpha_tracking,
+                alpha_spatial=unitrack_alpha_spatial,
+                alpha_temporal=unitrack_alpha_temporal,
+                beta_fp=unitrack_beta_fp,
+                beta_fn=unitrack_beta_fn,
+                gamma_switch=unitrack_gamma_switch,
+            )
 
     def initialize_for_single_clip(self, gt_instances: List[Instances]):
-        """Initialize for a batch of clips.
-        gt_instances: List[List[Instances]] when batch_size > 1,
-                      or List[Instances] when batch_size = 1.
-        """
         self.gt_instances = gt_instances
         self.num_samples = 0
         self.sample_device = None
         self._current_frame_idx = 0
         self.losses_dict = {}
 
-    def _get_gt_for_frame(self, frame_idx: int):
-        """Get ground truth for a specific frame, handling both single and batched clips."""
-        gt = self.gt_instances[frame_idx]
-        # If batched (List[List[Instances]]), take first sample from batch
-        if isinstance(gt, list) and len(gt) > 0:
-            return gt[0]
-        return gt
-
     def _step(self):
         self._current_frame_idx += 1
 
     def calc_loss_for_track_scores(self, track_instances: Instances):
-        """Calculate loss for track scores.
-        Uses _get_gt_for_frame to handle both single clip and batched clips.
-        """
         frame_id = self._current_frame_idx - 1
-        gt_instances = self._get_gt_for_frame(frame_id)
-
+        gt_instances = self.gt_instances[frame_id]
         outputs = {
             'pred_logits': track_instances.track_scores[None],
         }
@@ -93,7 +100,7 @@ class ClipMatcher(SetCriterion):
 
         num_tracks = len(track_instances)
         src_idx = torch.arange(num_tracks, dtype=torch.long, device=device)
-        tgt_idx = track_instances.matched_gt_idxes
+        tgt_idx = track_instances.matched_gt_idxes  # -1 for FP tracks and disappeared tracks
 
         track_losses = self.get_loss('labels',
                                      outputs=outputs,
@@ -189,17 +196,12 @@ class ClipMatcher(SetCriterion):
         return losses
 
     def match_for_single_frame(self, outputs: dict):
-        """Match tracks for a single frame in a clip.
-        Uses _get_gt_for_frame to cleanly handle both batch_size=1 and >1 cases.
-        """
         outputs_without_aux = {k: v for k, v in outputs.items() if k != 'aux_outputs'}
 
-        # Get ground truth for current frame (handles nested batch structure)
-        gt_instances_i = self._get_gt_for_frame(self._current_frame_idx)
-
+        gt_instances_i = self.gt_instances[self._current_frame_idx]  # gt instances of i-th image.
         track_instances: Instances = outputs_without_aux['track_instances']
-        pred_logits_i = track_instances.pred_logits
-        pred_boxes_i = track_instances.pred_boxes
+        pred_logits_i = track_instances.pred_logits  # predicted logits of i-th image.
+        pred_boxes_i = track_instances.pred_boxes  # predicted boxes of i-th image.
 
         obj_idxes = gt_instances_i.obj_ids
         outputs_i = {
@@ -214,7 +216,7 @@ class ClipMatcher(SetCriterion):
         track_instances.matched_gt_idxes[i] = j
 
         full_track_idxes = torch.arange(len(track_instances), dtype=torch.long, device=pred_logits_i.device)
-        matched_track_idxes = (track_instances.obj_idxes >= 0)  # occu 
+        matched_track_idxes = (track_instances.obj_idxes >= 0)  # occu
         prev_matched_indices = torch.stack(
             [full_track_idxes[matched_track_idxes], track_instances.matched_gt_idxes[matched_track_idxes]], dim=1)
 
@@ -310,6 +312,42 @@ class ClipMatcher(SetCriterion):
                 self.losses_dict.update(
                     {'frame_{}_ps{}_{}'.format(self._current_frame_idx, i, key): value for key, value in
                         l_dict.items()})
+
+        if self.use_unitrack:
+            valid_match = matched_indices[:, 1] >= 0
+            if valid_match.any():
+                matched_query_idx = matched_indices[valid_match, 0]
+                matched_gt_idx = matched_indices[valid_match, 1]
+                matched_track_ids = gt_instances_i.obj_ids[matched_gt_idx]
+                valid_track = matched_track_ids > 0
+                if valid_track.any():
+                    matched_query_idx = matched_query_idx[valid_track]
+                    matched_gt_idx = matched_gt_idx[valid_track]
+                    matched_track_ids = matched_track_ids[valid_track]
+
+                    # Build UniTrack inputs from current-frame decoder outputs,
+                    # avoiding alias with mutable track_instances container.
+                    unitrack_pred_boxes = box_ops.box_cxcywh_to_xyxy(outputs_i['pred_boxes'][0, matched_query_idx])
+                    unitrack_gt_boxes = box_ops.box_cxcywh_to_xyxy(gt_instances_i.boxes[matched_gt_idx])
+                    unitrack_outputs = {
+                        'pred_boxes': unitrack_pred_boxes.unsqueeze(0),
+                        'track_ids': matched_track_ids.unsqueeze(0),
+                    }
+                    unitrack_targets = [{
+                        'boxes': unitrack_gt_boxes,
+                        'labels': gt_instances_i.labels[matched_gt_idx],
+                        'track_ids': matched_track_ids,
+                    }]
+                    unitrack_losses = self.unitrack(unitrack_outputs, unitrack_targets)
+                    self.losses_dict['frame_{}_loss_unitrack'.format(self._current_frame_idx)] = unitrack_losses['loss_unitrack']
+                else:
+                    self.losses_dict['frame_{}_loss_unitrack'.format(self._current_frame_idx)] = torch.tensor(
+                        0.0, device=pred_logits_i.device
+                    )
+            else:
+                self.losses_dict['frame_{}_loss_unitrack'.format(self._current_frame_idx)] = torch.tensor(
+                    0.0, device=pred_logits_i.device
+                )
         self._step()
         return track_instances
 
@@ -317,9 +355,9 @@ class ClipMatcher(SetCriterion):
         # losses of each frame are calculated during the model's forwarding and are outputted by the model as outputs['losses_dict].
         losses = outputs.pop("losses_dict")
         num_samples = self.get_num_boxes(self.num_samples)
-        for loss_name, loss in losses.items():
-            losses[loss_name] /= num_samples
-        return losses
+        # Avoid in-place mutation on graph tensors when normalizing losses.
+        normalized_losses = {loss_name: loss / num_samples for loss_name, loss in losses.items()}
+        return normalized_losses
 
 
 class RuntimeTrackerBase(object):
@@ -672,84 +710,40 @@ class MOTR(nn.Module):
         return ret
 
     def forward(self, data: dict):
-        """MOTR forward pass with batch_size > 1 support.
-
-        This implementation processes each video clip independently but maintains
-        compatibility with the original single-clip design. The architecture allows
-        for future optimization to full (B*T) parallel computation.
-
-        Args:
-            data (dict): Input dictionary containing:
-                - 'imgs': List[List[Tensor]] - batch of video clips
-                - 'gt_instances': List[List[Instances]] - corresponding annotations
-                - 'proposals': Optional proposals for each clip
-                - 'run_mode': 'supervised' or 'sampling' for GRPO training
-
-        Returns:
-            dict: Model outputs with predictions and losses
-        """
         if self.training:
             self.criterion.initialize_for_single_clip(data['gt_instances'])
-
-        batch_frames = data['imgs']           # List[List[Tensor]], B clips, each with T frames
-        batch_gt_instances = data['gt_instances']
-        batch_proposals = data.get('proposals', [None] * len(batch_frames))
-
-        B = len(batch_frames)
+        frames = data['imgs']  # list of Tensor.
         outputs = {
             'pred_logits': [],
             'pred_boxes': [],
         }
-        final_track_instances = None
+        track_instances = None
         keys = list(self._generate_empty_tracks()._fields.keys())
+        for frame_index, (frame, gt, proposals) in enumerate(zip(frames, data['gt_instances'], data['proposals'])):
+            frame.requires_grad = False
+            is_last = frame_index == len(frames) - 1
 
-        # Process each clip in the batch
-        # Note: Full (B*T) flattening for backbone/transformer would be a
-        # more aggressive optimization. Current implementation prioritizes
-        # stability and correctness over maximum parallelism.
-        for b_idx in range(B):
-            clip_frames = batch_frames[b_idx]
-            clip_gts = batch_gt_instances[b_idx]
-            clip_proposals = batch_proposals[b_idx] if batch_proposals and b_idx < len(batch_proposals) else None
-            is_last = b_idx == B - 1
-
-            # Disable gradient for input images (critical for memory efficiency)
-            if isinstance(clip_frames, (list, tuple)):
-                for f in clip_frames:
-                    if isinstance(f, torch.Tensor):
-                        f.requires_grad = False
-            elif isinstance(clip_frames, torch.Tensor):
-                clip_frames.requires_grad = False
-
-            # Query denoise using first gt in this clip
-            gt_for_denoise = clip_gts[0] if isinstance(clip_gts, list) else clip_gts
             if self.query_denoise > 0:
                 l_1 = l_2 = self.query_denoise
-                gtboxes = gt_for_denoise.boxes.clone()
+                gtboxes = gt.boxes.clone()
                 _rs = torch.rand_like(gtboxes) * 2 - 1
                 gtboxes[..., :2] += gtboxes[..., 2:] * _rs[..., :2] * l_1
                 gtboxes[..., 2:] *= 1 + l_2 * _rs[..., 2:]
             else:
                 gtboxes = None
 
-            prop = clip_proposals[0] if isinstance(clip_proposals, list) else clip_proposals
-
-            # Initialize or extend track instances for this clip
-            if final_track_instances is None:
-                track_instances = self._generate_empty_tracks(prop)
+            if track_instances is None:
+                track_instances = self._generate_empty_tracks(proposals)
             else:
                 track_instances = Instances.cat([
-                    self._generate_empty_tracks(prop),
-                    final_track_instances])
+                    self._generate_empty_tracks(proposals),
+                    track_instances])
 
-            if self.use_checkpoint and b_idx < B - 1:
-                def fn(frame_input, gtboxes, *args):
-                    if isinstance(frame_input, (list, tuple)):
-                        frame_input = nested_tensor_from_tensor_list(frame_input)
-                    else:
-                        frame_input = nested_tensor_from_tensor_list([frame_input])
+            if self.use_checkpoint and frame_index < len(frames) - 1:
+                def fn(frame, gtboxes, *args):
+                    frame = nested_tensor_from_tensor_list([frame])
                     tmp = Instances((1, 1), **dict(zip(keys, args)))
-                    frame_res = self._forward_single_image(frame_input, tmp, gtboxes)
+                    frame_res = self._forward_single_image(frame, tmp, gtboxes)
                     return (
                         frame_res['pred_logits'],
                         frame_res['pred_boxes'],
@@ -758,9 +752,8 @@ class MOTR(nn.Module):
                         *[aux['pred_boxes'] for aux in frame_res['aux_outputs']]
                     )
 
-                frame_for_checkpoint = clip_frames
-                args = [frame_for_checkpoint, gtboxes] + [track_instances.get(k) for k in keys]
-                params = tuple(p for p in self.parameters() if p.requires_grad)
+                args = [frame, gtboxes] + [track_instances.get(k) for k in keys]
+                params = tuple((p for p in self.parameters() if p.requires_grad))
                 tmp = checkpoint.CheckpointFunction.apply(fn, len(args), *args, *params)
                 frame_res = {
                     'pred_logits': tmp[0],
@@ -772,35 +765,28 @@ class MOTR(nn.Module):
                     } for i in range(5)],
                 }
             else:
-                if isinstance(clip_frames, (list, tuple)):
-                    frame_tensor = nested_tensor_from_tensor_list(clip_frames)
-                else:
-                    frame_tensor = nested_tensor_from_tensor_list([clip_frames])
-                frame_res = self._forward_single_image(frame_tensor, track_instances, gtboxes)
-
+                frame = nested_tensor_from_tensor_list([frame])
+                frame_res = self._forward_single_image(frame, track_instances, gtboxes)
             current_run_mode = data.get('run_mode', 'supervised' if self.training else 'inference')
-            frame_res = self._post_process_single_image(
-                frame_res, track_instances, is_last, run_mode=current_run_mode)
+            frame_res = self._post_process_single_image(frame_res, track_instances, is_last, run_mode=current_run_mode)
 
             if current_run_mode == 'sampling':
                 if 'log_prob' not in outputs:
                     outputs['log_prob'] = []
-                if frame_res.get('log_prob') is not None:
-                    outputs['log_prob'].append(frame_res['log_prob'])
+                outputs['log_prob'].append(frame_res['log_prob'])
                 if 'frame_obj_idxes' in frame_res:
                     if 'obj_idxes_seq' not in outputs:
                         outputs['obj_idxes_seq'] = []
                     outputs['obj_idxes_seq'].append(frame_res['frame_obj_idxes'])
 
-            final_track_instances = frame_res.get('track_instances')
+            track_instances = frame_res['track_instances']
             outputs['pred_logits'].append(frame_res['pred_logits'])
             outputs['pred_boxes'].append(frame_res['pred_boxes'])
 
         if not self.training:
-            outputs['track_instances'] = final_track_instances
+            outputs['track_instances'] = track_instances
         else:
             outputs['losses_dict'] = self.criterion.losses_dict
-
         return outputs
 
 
@@ -817,9 +803,6 @@ def build(args):
     num_classes = dataset_to_num_classes[args.dataset_file]
     device = torch.device(args.device)
 
-    # Lazy import to avoid circular import with datasets module
-    from datasets import build_dataset
-
     backbone = build_backbone(args)
 
     transformer = build_deforamble_transformer(args)
@@ -835,6 +818,8 @@ def build(args):
                             'frame_{}_loss_bbox'.format(i): args.bbox_loss_coef,
                             'frame_{}_loss_giou'.format(i): args.giou_loss_coef,
                             })
+        if args.use_unitrack:
+            weight_dict.update({"frame_{}_loss_unitrack".format(i): args.unitrack_loss_coef})
 
     # TODO this is a hack
     if args.aux_loss:
@@ -856,7 +841,21 @@ def build(args):
     else:
         memory_bank = None
     losses = ['labels', 'boxes']
-    criterion = ClipMatcher(num_classes, matcher=img_matcher, weight_dict=weight_dict, losses=losses)
+    criterion = ClipMatcher(
+        num_classes,
+        matcher=img_matcher,
+        weight_dict=weight_dict,
+        losses=losses,
+        use_unitrack=args.use_unitrack,
+        unitrack_img_size=(args.unitrack_img_width, args.unitrack_img_height),
+        unitrack_iou_threshold=args.unitrack_iou_threshold,
+        unitrack_alpha_tracking=args.unitrack_alpha_tracking,
+        unitrack_alpha_spatial=args.unitrack_alpha_spatial,
+        unitrack_alpha_temporal=args.unitrack_alpha_temporal,
+        unitrack_beta_fp=args.unitrack_beta_fp,
+        unitrack_beta_fn=args.unitrack_beta_fn,
+        unitrack_gamma_switch=args.unitrack_gamma_switch,
+    )
     criterion.to(device)
     postprocessors = {}
     model = MOTR(
