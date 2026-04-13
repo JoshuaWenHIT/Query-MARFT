@@ -1,7 +1,3 @@
-# ------------------------------------------------------------------------
-# Copyright (c) 2026 Joshua Wen. All Rights Reserved.
-# ------------------------------------------------------------------------
-
 import math
 from typing import Dict, List, Tuple
 
@@ -33,12 +29,15 @@ class UnitrackCriterion(nn.Module):
         self.img_diagonal = math.sqrt(img_size[0] ** 2 + img_size[1] ** 2)
         self.scale_factor = 1.0 / max(self.img_diagonal, 1.0)
 
-        self.register_buffer("alpha_tracking", torch.tensor(alpha_tracking))
-        self.register_buffer("alpha_spatial", torch.tensor(alpha_spatial))
-        self.register_buffer("alpha_temporal", torch.tensor(alpha_temporal))
-        self.register_buffer("beta_fp", torch.tensor(beta_fp))
-        self.register_buffer("beta_fn", torch.tensor(beta_fn))
-        self.register_buffer("gamma_switch", torch.tensor(gamma_switch))
+        # Keep scalar weights as plain floats.
+        # In DDP, buffers can be broadcast every forward and cause autograd
+        # version mismatch when one optimizer step accumulates multiple forwards.
+        self.alpha_tracking = float(alpha_tracking)
+        self.alpha_spatial = float(alpha_spatial)
+        self.alpha_temporal = float(alpha_temporal)
+        self.beta_fp = float(beta_fp)
+        self.beta_fn = float(beta_fn)
+        self.gamma_switch = float(gamma_switch)
 
     def forward(self, outputs: Dict[str, torch.Tensor], targets: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
         device = outputs["pred_boxes"].device

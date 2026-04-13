@@ -1,6 +1,4 @@
 # ------------------------------------------------------------------------
-# Copyright (c) 2026 Joshua Wen. All Rights Reserved.
-# ------------------------------------------------------------------------
 # Copyright (c) 2022 megvii-research. All Rights Reserved.
 # ------------------------------------------------------------------------
 # Modified from Deformable DETR (https://github.com/fundamentalvision/Deformable-DETR)

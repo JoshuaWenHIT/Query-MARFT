@@ -24,6 +24,9 @@ def load_model(model, model_path, optimizer=None, resume=False,
     msg = 'If you see this, your model does not fully load the ' + \
           'pre-trained weight. Please make sure ' + \
           'you set the correct --num_classes for your own dataset.'
+    ignore_missing_prefixes = (
+        'criterion.unitrack.',
+    )
     for k in state_dict:
         if k in model_state_dict:
             if state_dict[k].shape != model_state_dict[k].shape:
@@ -46,6 +49,10 @@ def load_model(model, model_path, optimizer=None, resume=False,
             print('Drop parameter {}.'.format(k) + msg)
     for k in model_state_dict:
         if not (k in state_dict):
+            if k.startswith(ignore_missing_prefixes):
+                # Newly introduced optional criterion buffers; keep initialized defaults.
+                state_dict[k] = model_state_dict[k]
+                continue
             print('No param {}.'.format(k) + msg)
             state_dict[k] = model_state_dict[k]
     model.load_state_dict(state_dict, strict=False)

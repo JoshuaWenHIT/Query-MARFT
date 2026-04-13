@@ -280,6 +280,19 @@ def collate_fn(batch):
     return tuple(batch)
 
 
+def _mot_collate_tensors_contiguous(x: Any) -> Any:
+    """Make CPU tensors contiguous for nested collate output (helps pin_memory / copies)."""
+    if isinstance(x, Tensor):
+        return x.contiguous() if not x.is_contiguous() else x
+    if isinstance(x, dict):
+        return {k: _mot_collate_tensors_contiguous(v) for k, v in x.items()}
+    if isinstance(x, list):
+        return [_mot_collate_tensors_contiguous(v) for v in x]
+    if isinstance(x, tuple):
+        return tuple(_mot_collate_tensors_contiguous(v) for v in x)
+    return x
+
+
 def mot_collate_fn(batch: List[dict]) -> dict:
     ret_dict = {}
     for key in list(batch[0].keys()):
@@ -287,7 +300,7 @@ def mot_collate_fn(batch: List[dict]) -> dict:
         ret_dict[key] = [img_info[key] for img_info in batch]
         if len(ret_dict[key]) == 1:
             ret_dict[key] = ret_dict[key][0]
-    return ret_dict
+    return _mot_collate_tensors_contiguous(ret_dict)
 
 
 def iter_mot_clip_dicts(data_dict: Dict[str, Any]) -> Iterator[Dict[str, Any]]:

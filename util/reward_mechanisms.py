@@ -1,6 +1,3 @@
-# ------------------------------------------------------------------------
-# Copyright (c) 2026 JoshuaWenHIT. All Rights Reserved.
-# ------------------------------------------------------------------------
 import torch
 from typing import List
 
@@ -31,8 +28,21 @@ def compute_reward_from_obj_idxes(
     else:
         time_indices = list(range(len(obj_idxes_seq)))
 
-    # Stack: [T, N], T=num_frames, N=num_queries
-    obj_idxes = torch.stack([obj_idxes_seq[t] for t in time_indices], dim=0)
+    # NOTE:
+    # In this codebase, query count may vary across frames because proposals are
+    # concatenated dynamically. We pad shorter frames with -1 (unmatched) so that
+    # GRPO reward can be computed robustly instead of crashing on torch.stack.
+    selected = [obj_idxes_seq[t] for t in time_indices]
+    max_len = max(x.shape[0] for x in selected)
+    padded = []
+    for x in selected:
+        if x.shape[0] < max_len:
+            pad = torch.full((max_len - x.shape[0],), -1, dtype=x.dtype, device=x.device)
+            x = torch.cat([x, pad], dim=0)
+        padded.append(x)
+
+    # Shape: [T, N], T=num_frames, N=max_num_queries_in_group
+    obj_idxes = torch.stack(padded, dim=0)
     T, N = obj_idxes.shape
 
     total_reward = torch.tensor(0., device=device)

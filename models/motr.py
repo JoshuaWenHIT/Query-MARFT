@@ -1,6 +1,4 @@
 # ------------------------------------------------------------------------
-# Copyright (c) 2026 Joshua Wen. All Rights Reserved.
-# ------------------------------------------------------------------------
 # Copyright (c) 2022 megvii-research. All Rights Reserved.
 # ------------------------------------------------------------------------
 # Modified from Deformable DETR (https://github.com/fundamentalvision/Deformable-DETR)
@@ -80,12 +78,13 @@ class ClipMatcher(SetCriterion):
                 gamma_switch=unitrack_gamma_switch,
             )
 
-    def initialize_for_single_clip(self, gt_instances: List[Instances]):
+    def initialize_for_single_clip(self, gt_instances: List[Instances], skip_loss=False):
         self.gt_instances = gt_instances
         self.num_samples = 0
         self.sample_device = None
         self._current_frame_idx = 0
         self.losses_dict = {}
+        self.skip_loss = skip_loss
 
     def _step(self):
         self._current_frame_idx += 1
@@ -216,7 +215,7 @@ class ClipMatcher(SetCriterion):
         track_instances.matched_gt_idxes[i] = j
 
         full_track_idxes = torch.arange(len(track_instances), dtype=torch.long, device=pred_logits_i.device)
-        matched_track_idxes = (track_instances.obj_idxes >= 0)  # occu
+        matched_track_idxes = (track_instances.obj_idxes >= 0)  # occu 
         prev_matched_indices = torch.stack(
             [full_track_idxes[matched_track_idxes], track_instances.matched_gt_idxes[matched_track_idxes]], dim=1)
 
@@ -268,86 +267,87 @@ class ClipMatcher(SetCriterion):
         # step7. merge the unmatched pairs and the matched pairs.
         matched_indices = torch.cat([new_matched_indices, prev_matched_indices], dim=0)
 
-        # step8. calculate losses.
-        self.num_samples += len(gt_instances_i) + num_disappear_track
-        self.sample_device = pred_logits_i.device
-        for loss in self.losses:
-            new_track_loss = self.get_loss(loss,
-                                           outputs=outputs_i,
-                                           gt_instances=[gt_instances_i],
-                                           indices=[(matched_indices[:, 0], matched_indices[:, 1])],
-                                           num_boxes=1)
-            self.losses_dict.update(
-                {'frame_{}_{}'.format(self._current_frame_idx, key): value for key, value in new_track_loss.items()})
-
-        if 'aux_outputs' in outputs:
-            for i, aux_outputs in enumerate(outputs['aux_outputs']):
-                unmatched_outputs_layer = {
-                    'pred_logits': aux_outputs['pred_logits'][0, unmatched_track_idxes].unsqueeze(0),
-                    'pred_boxes': aux_outputs['pred_boxes'][0, unmatched_track_idxes].unsqueeze(0),
-                }
-                new_matched_indices_layer = match_for_single_decoder_layer(unmatched_outputs_layer, self.matcher)
-                matched_indices_layer = torch.cat([new_matched_indices_layer, prev_matched_indices], dim=0)
-                for loss in self.losses:
-                    if loss == 'masks':
-                        # Intermediate masks losses are too costly to compute, we ignore them.
-                        continue
-                    l_dict = self.get_loss(loss,
-                                           aux_outputs,
-                                           gt_instances=[gt_instances_i],
-                                           indices=[(matched_indices_layer[:, 0], matched_indices_layer[:, 1])],
-                                           num_boxes=1, )
-                    self.losses_dict.update(
-                        {'frame_{}_aux{}_{}'.format(self._current_frame_idx, i, key): value for key, value in
-                         l_dict.items()})
-
-        if 'ps_outputs' in outputs:
-            for i, aux_outputs in enumerate(outputs['ps_outputs']):
-                ar = torch.arange(len(gt_instances_i), device=obj_idxes.device)
-                l_dict = self.get_loss('boxes',
-                                        aux_outputs,
-                                        gt_instances=[gt_instances_i],
-                                        indices=[(ar, ar)],
-                                        num_boxes=1, )
+        if not self.skip_loss:
+            # step8. calculate losses.
+            self.num_samples += len(gt_instances_i) + num_disappear_track
+            self.sample_device = pred_logits_i.device
+            for loss in self.losses:
+                new_track_loss = self.get_loss(loss,
+                                               outputs=outputs_i,
+                                               gt_instances=[gt_instances_i],
+                                               indices=[(matched_indices[:, 0], matched_indices[:, 1])],
+                                               num_boxes=1)
                 self.losses_dict.update(
-                    {'frame_{}_ps{}_{}'.format(self._current_frame_idx, i, key): value for key, value in
-                        l_dict.items()})
+                    {'frame_{}_{}'.format(self._current_frame_idx, key): value for key, value in new_track_loss.items()})
 
-        if self.use_unitrack:
-            valid_match = matched_indices[:, 1] >= 0
-            if valid_match.any():
-                matched_query_idx = matched_indices[valid_match, 0]
-                matched_gt_idx = matched_indices[valid_match, 1]
-                matched_track_ids = gt_instances_i.obj_ids[matched_gt_idx]
-                valid_track = matched_track_ids > 0
-                if valid_track.any():
-                    matched_query_idx = matched_query_idx[valid_track]
-                    matched_gt_idx = matched_gt_idx[valid_track]
-                    matched_track_ids = matched_track_ids[valid_track]
-
-                    # Build UniTrack inputs from current-frame decoder outputs,
-                    # avoiding alias with mutable track_instances container.
-                    unitrack_pred_boxes = box_ops.box_cxcywh_to_xyxy(outputs_i['pred_boxes'][0, matched_query_idx])
-                    unitrack_gt_boxes = box_ops.box_cxcywh_to_xyxy(gt_instances_i.boxes[matched_gt_idx])
-                    unitrack_outputs = {
-                        'pred_boxes': unitrack_pred_boxes.unsqueeze(0),
-                        'track_ids': matched_track_ids.unsqueeze(0),
+            if 'aux_outputs' in outputs:
+                for i, aux_outputs in enumerate(outputs['aux_outputs']):
+                    unmatched_outputs_layer = {
+                        'pred_logits': aux_outputs['pred_logits'][0, unmatched_track_idxes].unsqueeze(0),
+                        'pred_boxes': aux_outputs['pred_boxes'][0, unmatched_track_idxes].unsqueeze(0),
                     }
-                    unitrack_targets = [{
-                        'boxes': unitrack_gt_boxes,
-                        'labels': gt_instances_i.labels[matched_gt_idx],
-                        'track_ids': matched_track_ids,
-                    }]
-                    unitrack_losses = self.unitrack(unitrack_outputs, unitrack_targets)
-                    self.losses_dict['frame_{}_loss_unitrack'.format(self._current_frame_idx)] = unitrack_losses['loss_unitrack']
+                    new_matched_indices_layer = match_for_single_decoder_layer(unmatched_outputs_layer, self.matcher)
+                    matched_indices_layer = torch.cat([new_matched_indices_layer, prev_matched_indices], dim=0)
+                    for loss in self.losses:
+                        if loss == 'masks':
+                            # Intermediate masks losses are too costly to compute, we ignore them.
+                            continue
+                        l_dict = self.get_loss(loss,
+                                               aux_outputs,
+                                               gt_instances=[gt_instances_i],
+                                               indices=[(matched_indices_layer[:, 0], matched_indices_layer[:, 1])],
+                                               num_boxes=1, )
+                        self.losses_dict.update(
+                            {'frame_{}_aux{}_{}'.format(self._current_frame_idx, i, key): value for key, value in
+                             l_dict.items()})
+
+            if 'ps_outputs' in outputs:
+                for i, aux_outputs in enumerate(outputs['ps_outputs']):
+                    ar = torch.arange(len(gt_instances_i), device=obj_idxes.device)
+                    l_dict = self.get_loss('boxes',
+                                            aux_outputs,
+                                            gt_instances=[gt_instances_i],
+                                            indices=[(ar, ar)],
+                                            num_boxes=1, )
+                    self.losses_dict.update(
+                        {'frame_{}_ps{}_{}'.format(self._current_frame_idx, i, key): value for key, value in
+                            l_dict.items()})
+
+            if self.use_unitrack:
+                valid_match = matched_indices[:, 1] >= 0
+                if valid_match.any():
+                    matched_query_idx = matched_indices[valid_match, 0]
+                    matched_gt_idx = matched_indices[valid_match, 1]
+                    matched_track_ids = gt_instances_i.obj_ids[matched_gt_idx]
+                    valid_track = matched_track_ids > 0
+                    if valid_track.any():
+                        matched_query_idx = matched_query_idx[valid_track]
+                        matched_gt_idx = matched_gt_idx[valid_track]
+                        matched_track_ids = matched_track_ids[valid_track]
+
+                        # Build UniTrack inputs from current-frame decoder outputs,
+                        # avoiding alias with mutable track_instances container.
+                        unitrack_pred_boxes = box_ops.box_cxcywh_to_xyxy(outputs_i['pred_boxes'][0, matched_query_idx])
+                        unitrack_gt_boxes = box_ops.box_cxcywh_to_xyxy(gt_instances_i.boxes[matched_gt_idx])
+                        unitrack_outputs = {
+                            'pred_boxes': unitrack_pred_boxes.unsqueeze(0),
+                            'track_ids': matched_track_ids.unsqueeze(0),
+                        }
+                        unitrack_targets = [{
+                            'boxes': unitrack_gt_boxes,
+                            'labels': gt_instances_i.labels[matched_gt_idx],
+                            'track_ids': matched_track_ids,
+                        }]
+                        unitrack_losses = self.unitrack(unitrack_outputs, unitrack_targets)
+                        self.losses_dict['frame_{}_loss_unitrack'.format(self._current_frame_idx)] = unitrack_losses['loss_unitrack']
+                    else:
+                        self.losses_dict['frame_{}_loss_unitrack'.format(self._current_frame_idx)] = torch.tensor(
+                            0.0, device=pred_logits_i.device
+                        )
                 else:
                     self.losses_dict['frame_{}_loss_unitrack'.format(self._current_frame_idx)] = torch.tensor(
                         0.0, device=pred_logits_i.device
                     )
-            else:
-                self.losses_dict['frame_{}_loss_unitrack'.format(self._current_frame_idx)] = torch.tensor(
-                    0.0, device=pred_logits_i.device
-                )
         self._step()
         return track_instances
 
@@ -711,11 +711,16 @@ class MOTR(nn.Module):
 
     def forward(self, data: dict):
         if self.training:
-            self.criterion.initialize_for_single_clip(data['gt_instances'])
+            self.criterion.initialize_for_single_clip(
+                data['gt_instances'],
+                skip_loss=data.get('skip_loss', False),
+            )
         frames = data['imgs']  # list of Tensor.
+        skip_loss = data.get('skip_loss', False)
+        collect_outputs = not (self.training and skip_loss and data.get('run_mode', '') == 'sampling')
         outputs = {
-            'pred_logits': [],
-            'pred_boxes': [],
+            'pred_logits': [] if collect_outputs else None,
+            'pred_boxes': [] if collect_outputs else None,
         }
         track_instances = None
         keys = list(self._generate_empty_tracks()._fields.keys())
@@ -780,12 +785,13 @@ class MOTR(nn.Module):
                     outputs['obj_idxes_seq'].append(frame_res['frame_obj_idxes'])
 
             track_instances = frame_res['track_instances']
-            outputs['pred_logits'].append(frame_res['pred_logits'])
-            outputs['pred_boxes'].append(frame_res['pred_boxes'])
+            if collect_outputs:
+                outputs['pred_logits'].append(frame_res['pred_logits'])
+                outputs['pred_boxes'].append(frame_res['pred_boxes'])
 
         if not self.training:
             outputs['track_instances'] = track_instances
-        else:
+        elif not skip_loss:
             outputs['losses_dict'] = self.criterion.losses_dict
         return outputs
 

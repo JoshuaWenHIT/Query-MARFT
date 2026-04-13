@@ -20,6 +20,7 @@ import sys
 from typing import Iterable
 
 import torch
+from torch.cuda.amp import autocast, GradScaler
 import util.misc as utils
 from util.reward_mechanisms import compute_reward_from_obj_idxes
 
@@ -28,9 +29,10 @@ from datasets.data_prefetcher import data_dict_to_cuda
 
 def train_one_epoch_mot(model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
-                    device: torch.device, epoch: int, max_norm: float = 0):
+                    device: torch.device, epoch: int, max_norm: float = 0, use_amp: bool = False):
     model.train()
     criterion.train()
+    scaler = GradScaler(enabled=use_amp)
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
     # metric_logger.add_meter('class_error', utils.SmoothedValue(window_size=1, fmt='{value:.2f}'))
@@ -46,10 +48,11 @@ def train_one_epoch_mot(model: torch.nn.Module, criterion: torch.nn.Module,
         loss_dict = None
         losses = None
         for sub in clip_dicts:
-            outputs = model(sub)
-            ld = criterion(outputs, sub)
-            weight_dict = criterion.weight_dict
-            li = sum(ld[k] * weight_dict[k] for k in ld.keys() if k in weight_dict)
+            with autocast(enabled=use_amp):
+                outputs = model(sub)
+                ld = criterion(outputs, sub)
+                weight_dict = criterion.weight_dict
+                li = sum(ld[k] * weight_dict[k] for k in ld.keys() if k in weight_dict)
             if loss_dict is None:
                 loss_dict = {k: ld[k].clone() for k in ld}
                 losses = li
@@ -77,13 +80,23 @@ def train_one_epoch_mot(model: torch.nn.Module, criterion: torch.nn.Module,
             print(loss_dict_reduced)
             sys.exit(1)
 
-        optimizer.zero_grad()
-        losses.backward()
-        if max_norm > 0:
-            grad_total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+        optimizer.zero_grad(set_to_none=True)
+        if use_amp:
+            scaler.scale(losses).backward()
+            scaler.unscale_(optimizer)
+            if max_norm > 0:
+                grad_total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+            else:
+                grad_total_norm = utils.get_total_grad_norm(model.parameters(), max_norm)
+            scaler.step(optimizer)
+            scaler.update()
         else:
-            grad_total_norm = utils.get_total_grad_norm(model.parameters(), max_norm)
-        optimizer.step()
+            losses.backward()
+            if max_norm > 0:
+                grad_total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+            else:
+                grad_total_norm = utils.get_total_grad_norm(model.parameters(), max_norm)
+            optimizer.step()
 
         # metric_logger.update(loss=loss_value, **loss_dict_reduced_scaled, **loss_dict_reduced_unscaled)
         metric_logger.update(loss=loss_value, **loss_dict_reduced_scaled)
@@ -101,7 +114,8 @@ def train_one_epoch_grpo(model: torch.nn.Module, criterion: torch.nn.Module,
                          data_loader: Iterable, optimizer: torch.optim.Optimizer,
                          device: torch.device, epoch: int, max_norm: float = 0,
                          id_switch_penalty: float = 15.0, id_stable_reward: float = 1.0,
-                         grpo_loss_weight: float = 1.0, grpo_group_size: int = 4):
+                         grpo_loss_weight: float = 1.0, grpo_group_size: int = 4,
+                         use_amp: bool = False):
     """
     GRPO 组采样训练流程，继承 train_one_epoch_mot 的监督 loss，并加入基于 obj_idxes 的奖励 loss：
     - 监督 loss：criterion 的 loss_dict（同 train_one_epoch_mot）
@@ -113,6 +127,7 @@ def train_one_epoch_grpo(model: torch.nn.Module, criterion: torch.nn.Module,
     """
     model.train()
     criterion.train()
+    scaler = GradScaler(enabled=use_amp)
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
     metric_logger.add_meter('grad_norm', utils.SmoothedValue(window_size=1, fmt='{value:.2f}'))
@@ -138,8 +153,12 @@ def train_one_epoch_grpo(model: torch.nn.Module, criterion: torch.nn.Module,
             rewards_list = []
             total_log_probs_list = []
             outputs_for_criterion = None
-            for _ in range(grpo_group_size):
-                outputs = model(sub)
+            for sample_idx in range(grpo_group_size):
+                # For GRPO samples that are not used for supervised loss, skip loss
+                # construction inside ClipMatcher to save compute.
+                sub['skip_loss'] = sample_idx < (grpo_group_size - 1)
+                with autocast(enabled=use_amp):
+                    outputs = model(sub)
                 outputs_for_criterion = outputs  # 取最后一组用于监督 loss
                 obj_idxes_seq = outputs.get('obj_idxes_seq', [])
                 log_probs = outputs.get('log_prob', [])
@@ -153,9 +172,11 @@ def train_one_epoch_grpo(model: torch.nn.Module, criterion: torch.nn.Module,
                     rewards_list.append(reward)
                     total_log_probs_list.append(total_log_prob)
 
+            sub['skip_loss'] = False
             # 监督 loss：用最后一组 outputs（与原始逻辑一致）
-            ld = criterion(outputs_for_criterion, sub)
-            sup_i = sum(ld[k] * weight_dict[k] for k in ld.keys() if k in weight_dict)
+            with autocast(enabled=use_amp):
+                ld = criterion(outputs_for_criterion, sub)
+                sup_i = sum(ld[k] * weight_dict[k] for k in ld.keys() if k in weight_dict)
 
             # GRPO 奖励 loss：组内优势 = reward_i - mean(rewards)
             loss_grpo = torch.tensor(0., device=device)
@@ -210,13 +231,23 @@ def train_one_epoch_grpo(model: torch.nn.Module, criterion: torch.nn.Module,
             print(loss_dict_reduced)
             sys.exit(1)
 
-        optimizer.zero_grad()
-        losses.backward()
-        if max_norm > 0:
-            grad_total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+        optimizer.zero_grad(set_to_none=True)
+        if use_amp:
+            scaler.scale(losses).backward()
+            scaler.unscale_(optimizer)
+            if max_norm > 0:
+                grad_total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+            else:
+                grad_total_norm = utils.get_total_grad_norm(model.parameters(), max_norm)
+            scaler.step(optimizer)
+            scaler.update()
         else:
-            grad_total_norm = utils.get_total_grad_norm(model.parameters(), max_norm)
-        optimizer.step()
+            losses.backward()
+            if max_norm > 0:
+                grad_total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+            else:
+                grad_total_norm = utils.get_total_grad_norm(model.parameters(), max_norm)
+            optimizer.step()
 
         metric_logger.update(loss=loss_value, **loss_dict_reduced_scaled)
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
