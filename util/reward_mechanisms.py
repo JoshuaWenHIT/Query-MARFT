@@ -1,3 +1,6 @@
+# ------------------------------------------------------------------------
+# Copyright (c) 2026 JoshuaWenHIT. All Rights Reserved.
+# ------------------------------------------------------------------------
 import torch
 from typing import List
 
@@ -6,15 +9,20 @@ def compute_reward_from_obj_idxes(
     obj_idxes_seq: List[torch.Tensor],
     id_switch_penalty: float = 15.0,
     id_stable_reward: float = 1.0,
+    fp_penalty: float = 2.0,
+    scores_seq: List[torch.Tensor] = None,
     group_indices=None,
 ):
     """
     基于 ClipMatcher 更新后的 track_instances.obj_idxes 计算 Reward。
     obj_idxes_seq: 每帧的 obj_idxes tensor 列表，由 model forward 在 run_mode='sampling' 时收集。
         每个 tensor 形状 [N]，表示该帧每个 query 匹配到的 GT 目标 ID（-1 表示未匹配）。
+    scores_seq: 每帧的 Bernoulli action (0/1) 列表，形状同 obj_idxes_seq。
+        用于识别 False Positive：action=1 但 obj_idxes=-1 的 query。
     对比连续两帧之间同一 query 索引的 obj_idxes：
     - 从一个正值变为另一个不同的正值 -> ID Switch，扣除 id_switch_penalty 分（默认 15）
     - 保持一致 -> 给予 id_stable_reward 分
+    - 被激活 (action=1) 但未匹配到 GT (obj_idxes=-1) -> FP，扣除 fp_penalty 分
 
     Returns:
         reward: scalar tensor (higher is better)
@@ -45,11 +53,28 @@ def compute_reward_from_obj_idxes(
     obj_idxes = torch.stack(padded, dim=0)
     T, N = obj_idxes.shape
 
+    # Pad scores_seq the same way (pad with 0 = inactive)
+    scores = None
+    if scores_seq is not None and len(scores_seq) > 0:
+        selected_scores = [scores_seq[t] for t in time_indices]
+        padded_scores = []
+        for s in selected_scores:
+            if s.shape[0] < max_len:
+                pad = torch.zeros(max_len - s.shape[0], dtype=s.dtype, device=s.device)
+                s = torch.cat([s, pad], dim=0)
+            padded_scores.append(s)
+        scores = torch.stack(padded_scores, dim=0)  # [T, N]
+
     total_reward = torch.tensor(0., device=device)
     for qi in range(N):
         prev_obj_id = -1
         for t in range(T):
             curr_obj_id = obj_idxes[t, qi].item()
+
+            # FP penalty: query was activated but not matched to any GT
+            if scores is not None and scores[t, qi].item() > 0.5 and curr_obj_id == -1:
+                total_reward = total_reward - fp_penalty
+
             if curr_obj_id == -1:
                 prev_obj_id = -1
                 continue
@@ -59,7 +84,6 @@ def compute_reward_from_obj_idxes(
             if curr_obj_id == prev_obj_id:
                 total_reward = total_reward + id_stable_reward
             else:
-                # ID Switch: 从一个正值变为另一个不同的正值
                 total_reward = total_reward - id_switch_penalty
                 prev_obj_id = curr_obj_id
 

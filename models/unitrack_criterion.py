@@ -1,3 +1,6 @@
+# ------------------------------------------------------------------------
+# Copyright (c) 2026 JoshuaWenHIT. All Rights Reserved.
+# ------------------------------------------------------------------------
 import math
 from typing import Dict, List, Tuple
 

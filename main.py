@@ -1,4 +1,6 @@
 # ------------------------------------------------------------------------
+# Copyright (c) 2026 JoshuaWenHIT. All Rights Reserved.
+# ------------------------------------------------------------------------
 # Copyright (c) 2022 megvii-research. All Rights Reserved.
 # ------------------------------------------------------------------------
 # Modified from Deformable DETR (https://github.com/fundamentalvision/Deformable-DETR)
@@ -200,6 +202,8 @@ def get_args_parser():
     parser.add_argument('--use_grpo', action='store_true', help='Use GRPO group sampling with obj_idxes-based reward')
     parser.add_argument('--grpo_id_switch_penalty', type=float, default=15.0)
     parser.add_argument('--grpo_id_stable_reward', type=float, default=1.0)
+    parser.add_argument('--grpo_fp_penalty', type=float, default=2.0,
+                        help='Per-query per-frame penalty for false positives (activated but unmatched)')
     parser.add_argument('--grpo_loss_weight', type=float, default=1.0, help='Weight for GRPO reward loss in total loss')
     parser.add_argument('--grpo_group_size', type=int, default=5, help='Number of samples per group for GRPO advantage')
     parser.add_argument('--use_amp', action='store_true', help='Enable automatic mixed precision training')
@@ -348,6 +352,7 @@ def main(args):
             train_stats = train_one_epoch_grpo(
                 model, criterion, data_loader_train, optimizer, device, epoch, args.clip_max_norm,
                 id_switch_penalty=args.grpo_id_switch_penalty, id_stable_reward=args.grpo_id_stable_reward,
+                fp_penalty=args.grpo_fp_penalty,
                 grpo_loss_weight=args.grpo_loss_weight, grpo_group_size=args.grpo_group_size,
                 use_amp=args.use_amp)
         else:

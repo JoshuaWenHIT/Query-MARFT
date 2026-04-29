@@ -1,4 +1,6 @@
 # ------------------------------------------------------------------------
+# Copyright (c) 2026 JoshuaWenHIT. All Rights Reserved.
+# ------------------------------------------------------------------------
 # Copyright (c) 2022 megvii-research. All Rights Reserved.
 # ------------------------------------------------------------------------
 # Modified from Deformable DETR (https://github.com/fundamentalvision/Deformable-DETR)
@@ -670,6 +672,7 @@ class MOTR(nn.Module):
             # For GRPO: save obj_idxes (GT-matched IDs) after ClipMatcher, for reward computation
             if run_mode == 'sampling':
                 frame_res['frame_obj_idxes'] = track_instances.obj_idxes.clone()
+                frame_res['frame_scores'] = track_scores.clone()
         else:
             # each track will be assigned an unique global id by the track base.
             self.track_base.update(track_instances)
@@ -783,6 +786,10 @@ class MOTR(nn.Module):
                     if 'obj_idxes_seq' not in outputs:
                         outputs['obj_idxes_seq'] = []
                     outputs['obj_idxes_seq'].append(frame_res['frame_obj_idxes'])
+                if 'frame_scores' in frame_res:
+                    if 'scores_seq' not in outputs:
+                        outputs['scores_seq'] = []
+                    outputs['scores_seq'].append(frame_res['frame_scores'])
 
             track_instances = frame_res['track_instances']
             if collect_outputs:

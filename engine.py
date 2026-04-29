@@ -114,6 +114,7 @@ def train_one_epoch_grpo(model: torch.nn.Module, criterion: torch.nn.Module,
                          data_loader: Iterable, optimizer: torch.optim.Optimizer,
                          device: torch.device, epoch: int, max_norm: float = 0,
                          id_switch_penalty: float = 15.0, id_stable_reward: float = 1.0,
+                         fp_penalty: float = 2.0,
                          grpo_loss_weight: float = 1.0, grpo_group_size: int = 4,
                          use_amp: bool = False):
     """
@@ -161,12 +162,15 @@ def train_one_epoch_grpo(model: torch.nn.Module, criterion: torch.nn.Module,
                     outputs = model(sub)
                 outputs_for_criterion = outputs  # 取最后一组用于监督 loss
                 obj_idxes_seq = outputs.get('obj_idxes_seq', [])
+                scores_seq = outputs.get('scores_seq', [])
                 log_probs = outputs.get('log_prob', [])
                 if obj_idxes_seq and log_probs:
                     reward = compute_reward_from_obj_idxes(
                         obj_idxes_seq,
                         id_switch_penalty=id_switch_penalty,
                         id_stable_reward=id_stable_reward,
+                        fp_penalty=fp_penalty,
+                        scores_seq=scores_seq,
                     )
                     total_log_prob = sum(lp.sum() for lp in log_probs)
                     rewards_list.append(reward)
